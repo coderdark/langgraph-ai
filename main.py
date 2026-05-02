@@ -32,6 +32,7 @@ def call_model(state: MessagesState) -> dict:
         temperature=0,
     )
     model = llm.bind_tools(TOOLS, tool_choice="auto")
+
     reply = model.invoke(state["messages"])
 
     return {"messages": [reply]}
