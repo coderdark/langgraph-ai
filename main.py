@@ -2,27 +2,38 @@ import os
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 
 # Load OPENAI_API_KEY and MODEL from a .env file into os.environ (if present).
 load_dotenv()
 
 
-def call_model(state: MessagesState) -> dict:
-    """Graph node: send the current conversation to the LLM and append its reply.
+@tool
+def multiply(a: float, b: float) -> str:
+    """Multiply two numbers together."""
+    return str(a * b) + " is the result of the multiplication of " + str(a) + " and " + str(b)
 
-    MessagesState keeps a `messages` list; LangGraph merges returned messages
-    into that list (so the human turn stays, and the assistant reply is added).
+
+# Tools the LLM may call (OpenAI function-calling format is applied in bind_tools, not in ChatOpenAI(...)).
+TOOLS = [multiply]
+
+
+def call_model(state: MessagesState) -> dict:
+    """Graph node: send messages to the LLM (with tools bound) and append its reply.
+
+    Use bind_tools(...) instead of ChatOpenAI(tools=...). Constructor kwargs that are not
+    first-class fields end up in model_kwargs and break the OpenAI client serializer.
     """
-    model = ChatOpenAI(
+    llm = ChatOpenAI(
         model=os.environ.get("MODEL", "gpt-4o-mini"),
         temperature=0,
     )
-    # Runs one completion for the full message list (here: one user message).
+    model = llm.bind_tools(TOOLS, tool_choice="auto")
     reply = model.invoke(state["messages"])
 
-    # Return only the new assistant message; the graph merges it into state.
     return {"messages": [reply]}
 
 
@@ -30,21 +41,32 @@ def main() -> None:
     if not os.environ.get("OPENAI_API_KEY"):
         raise SystemExit("Set OPENAI_API_KEY in your environment or .env file.")
 
-    # Define a graph whose state shape is the standard chat "messages" channel.
     graph = StateGraph(MessagesState)
-    # Register our LLM step as a named node.
     graph.add_node("model", call_model)
-    # Wire the flow: entry → call the model once → exit.
-    graph.add_edge(START, "model")
-    graph.add_edge("model", END)
+    graph.add_node("tools", ToolNode(TOOLS))
 
-    # Build a runnable app (checks the graph is valid, prepares execution).
+    graph.add_edge(START, "model")
+    # After the LLM: run tools if the last AIMessage has tool_calls, else finish.
+    graph.add_conditional_edges(
+        "model",
+        tools_condition,
+        {"tools": "tools", "__end__": END},
+    )
+    # Tool messages go back to the model for a natural-language answer.
+    graph.add_edge("tools", "model")
+
     app = graph.compile()
 
-    # Run the graph once: initial state is a single user message.
-    result = app.invoke({"messages": [HumanMessage(content="I am learning about LangGraph")]})
+    result = app.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content="I am learning about LangGraph; what is 3.13 * 8.2?",
+                )
+            ],
+        },
+    )
 
-    # After the run, `messages` contains the user message plus the model reply.
     for message in result["messages"]:
         print(f"{message.type}: {message.content}")
 
